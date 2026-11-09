@@ -1,6 +1,11 @@
 package postgres_test
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,7 +19,12 @@ import (
 // module; these need no database.
 
 func TestDialector(t *testing.T) {
-	if got := (postgres.Driver{}).Dialector("postgres://x/y").Name(); got != "postgres" {
+	pool, err := (postgres.Driver{}).OpenDB(gormdb.PostgresCfg{Host: "db", DbName: "app"})
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer func() { _ = pool.Close() }()
+	if got := (postgres.Driver{}).Dialector(pool).Name(); got != "postgres" {
 		t.Errorf("Dialector name = %q, want postgres", got)
 	}
 }
@@ -59,6 +69,67 @@ func TestDSNRoundTripsThroughPgx(t *testing.T) {
 				t.Errorf("application_name = %q, want %q", got, tricky)
 			}
 		})
+	}
+}
+
+// unreachable is a connector whose connections always fail, as against a
+// database that is down.
+type unreachable struct{}
+
+func (unreachable) Connect(context.Context) (driver.Conn, error) {
+	return nil, errors.New("connection refused")
+}
+func (unreachable) Driver() driver.Driver { return nil }
+
+// poolDriver is an app's driver that builds the pool itself: it embeds the
+// shipped driver and replaces OpenDB, and records the config it was given.
+type poolDriver struct {
+	postgres.Driver
+	pool *sql.DB
+	err  error
+	got  *gormdb.PostgresCfg
+}
+
+func (d poolDriver) OpenDB(cfg gormdb.PostgresCfg) (*sql.DB, error) {
+	if d.got != nil {
+		*d.got = cfg
+	}
+	return d.pool, d.err
+}
+
+// A failed Open must not leave the pool, and its connection opener
+// goroutine, behind: Open owns the pool the driver returned.
+func TestFailedOpenClosesPool(t *testing.T) {
+	pool := sql.OpenDB(unreachable{})
+	defer func() { _ = pool.Close() }()
+	var got gormdb.PostgresCfg
+	pg := gormdb.PostgresCfg{Host: "db", User: "app", DbName: "app", MaxOpenConns: 7}
+	cfg := gormdb.Cfg{Driver: gormdb.DriverPostgres, Logger: gormlogger.Discard, Postgres: pg}
+	db, err := gormdb.Open(cfg, gormdb.Drivers{Postgres: poolDriver{pool: pool, got: &got}})
+	if err == nil {
+		_ = gormdb.Close(db)
+		t.Fatal("Open with a failing ping succeeded")
+	}
+	if got.Host != "db" || got.User != "app" || got.DbName != "app" {
+		t.Errorf("OpenDB got %v, want the config passed to Open", got)
+	}
+	if n := pool.Stats().MaxOpenConnections; n != 7 {
+		t.Errorf("MaxOpenConnections = %d, want 7 set on the driver's pool", n)
+	}
+	if err := pool.Ping(); err == nil || !strings.Contains(err.Error(), "database is closed") {
+		t.Errorf("the pool is still open after the failed Open: ping got %v", err)
+	}
+}
+
+// An error from the driver's OpenDB, or no pool, fails Open.
+func TestOpenDBFailure(t *testing.T) {
+	cfg := gormdb.Cfg{Driver: gormdb.DriverPostgres, Logger: gormlogger.Discard, Postgres: gormdb.PostgresCfg{Host: "db", DbName: "app"}}
+	boom := errors.New("no token")
+	if _, err := gormdb.Open(cfg, gormdb.Drivers{Postgres: poolDriver{err: boom}}); !errors.Is(err, boom) {
+		t.Errorf("Open = %v, want the OpenDB error", err)
+	}
+	if _, err := gormdb.Open(cfg, gormdb.Drivers{Postgres: poolDriver{}}); err == nil {
+		t.Error("Open with a nil pool succeeded")
 	}
 }
 

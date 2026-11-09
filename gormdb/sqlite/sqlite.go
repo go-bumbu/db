@@ -1,11 +1,15 @@
 // Package sqlite adapts the pure-Go glebarez SQLite driver to gormdb, so the
 // binary builds without CGO. Importing it registers the database/sql driver
-// "sqlite".
+// "sqlite", the name modernc.org/sqlite registers too: a binary that links
+// both panics at init.
 package sqlite
 
 import (
+	"database/sql"
 	"fmt"
+	"maps"
 	"net/url"
+	"slices"
 	"time"
 
 	glebarez "github.com/glebarez/sqlite"
@@ -18,8 +22,19 @@ type Driver struct{}
 
 var _ gormdb.SqliteDriver = Driver{}
 
-// SQLDriverName returns the database/sql driver name glebarez registers.
-func (Driver) SQLDriverName() string { return "sqlite" }
+// OpenDB returns a connection pool for dsn with the database/sql driver
+// glebarez registers, "sqlite".
+func (Driver) OpenDB(dsn string) (*sql.DB, error) { return sql.Open("sqlite", dsn) }
+
+// PragmaParams returns the pragmas as glebarez's _pragma=name(value)
+// parameters, sorted by name.
+func (Driver) PragmaParams(pragmas map[string]string) url.Values {
+	q := url.Values{}
+	for _, name := range slices.Sorted(maps.Keys(pragmas)) {
+		q.Add("_pragma", name+"("+pragmas[name]+")")
+	}
+	return q
+}
 
 // WriterParams returns the writer's DSN query parameters in glebarez's format.
 func (Driver) WriterParams(busyTimeout time.Duration) url.Values {

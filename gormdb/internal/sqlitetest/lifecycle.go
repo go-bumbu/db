@@ -14,7 +14,6 @@ import (
 	"github.com/go-bumbu/db/gormdb"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
-	"gorm.io/plugin/dbresolver"
 )
 
 // within fails the test when fn does not return in time: a deadlock must fail,
@@ -61,7 +60,7 @@ func connectionStaysPinned(t *testing.T, drv gormdb.SqliteDriver) {
 		t.Errorf("n = %d, last_insert_rowid = %d, want 7 and 1", n, rowid)
 	}
 	// outside db.Connection, reads still go to the read pool
-	if err := db.Clauses(dbresolver.Read).Exec("INSERT INTO counter VALUES (1)").Error; err == nil {
+	if err := db.Clauses(gormdb.Read).Exec("INSERT INTO counter VALUES (1)").Error; err == nil {
 		t.Error("a write forced onto the read pool succeeded after db.Connection")
 	}
 }
@@ -70,7 +69,7 @@ func connectionStaysPinned(t *testing.T, drv gormdb.SqliteDriver) {
 // turns waiting off.
 func subMillisecondBusyTimeout(t *testing.T, drv gormdb.SqliteDriver) {
 	db := open(t, drv, gormdb.SqliteCfg{Path: filepath.Join(t.TempDir(), "test.db"), BusyTimeout: 500 * time.Microsecond})
-	for name, q := range map[string]*gorm.DB{"writer": db, "reader": db.Clauses(dbresolver.Read)} {
+	for name, q := range map[string]*gorm.DB{"writer": db, "reader": db.Clauses(gormdb.Read)} {
 		var got string
 		if err := q.Raw("PRAGMA busy_timeout").Scan(&got).Error; err != nil {
 			t.Fatalf("%s: %v", name, err)
@@ -107,7 +106,7 @@ func closeWaitsForReads(t *testing.T, drv gormdb.SqliteDriver) {
 			t.Fatalf("%s: %v", stmt, err)
 		}
 	}
-	rows, err := db.Clauses(dbresolver.Read).Raw("SELECT n FROM counter").Rows()
+	rows, err := db.Clauses(gormdb.Read).Raw("SELECT n FROM counter").Rows()
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}

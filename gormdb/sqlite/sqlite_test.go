@@ -29,4 +29,13 @@ func TestParams(t *testing.T) {
 	if got := r.Get("_txlock"); got != "" {
 		t.Errorf("reader _txlock = %q, want empty", got)
 	}
+
+	p := sqlite.Driver{}.PragmaParams(map[string]string{"temp_store": "2", "synchronous": "NORMAL"})
+	wantP := []string{"synchronous(NORMAL)", "temp_store(2)"} // sorted, so the DSN is stable
+	if got := p["_pragma"]; !slices.Equal(got, wantP) || len(p) != 1 {
+		t.Errorf("pragma params = %v, want _pragma %v", p, wantP)
+	}
+	if got := (sqlite.Driver{}).PragmaParams(nil); len(got) != 0 {
+		t.Errorf("no pragmas: got %v, want none", got)
+	}
 }

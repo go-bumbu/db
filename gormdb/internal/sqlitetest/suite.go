@@ -34,6 +34,9 @@ func Run(t *testing.T, drv gormdb.SqliteDriver) {
 	t.Run("awkward folder", func(t *testing.T) { awkwardFolder(t, drv) })
 	// not parallel: t.Chdir changes the process working directory
 	t.Run("relative path", func(t *testing.T) { relativePath(t, drv) })
+	t.Run("chdir after open", func(t *testing.T) { chdirAfterOpen(t, drv) })
+	t.Run("extra pragmas", func(t *testing.T) { extraPragmas(t, drv) })
+	t.Run("own resolver rejected", func(t *testing.T) { ownResolverRejected(t, drv) })
 	t.Run("close closes readers", func(t *testing.T) { closeClosesReaders(t, drv) })
 	t.Run("close checkpoints the WAL", func(t *testing.T) { closeCheckpointsWAL(t, drv) })
 	t.Run("file URI rejected", func(t *testing.T) { fileURIRejected(t, drv) })
@@ -337,7 +340,7 @@ func readerPragmas(t *testing.T, drv gormdb.SqliteDriver) {
 	}
 	for pragma, want := range pragmas {
 		var got string
-		if err := db.Clauses(dbresolver.Read).Raw("PRAGMA " + pragma).Scan(&got).Error; err != nil {
+		if err := db.Clauses(gormdb.Read).Raw("PRAGMA " + pragma).Scan(&got).Error; err != nil {
 			t.Fatalf("read %s: %v", pragma, err)
 		}
 		if got != want {
@@ -348,7 +351,7 @@ func readerPragmas(t *testing.T, drv gormdb.SqliteDriver) {
 
 func readerCannotWrite(t *testing.T, drv gormdb.SqliteDriver) {
 	db := openWithCounter(t, drv, 0)
-	err := db.Clauses(dbresolver.Read).Exec("INSERT INTO counter VALUES (1)").Error
+	err := db.Clauses(gormdb.Read).Exec("INSERT INTO counter VALUES (1)").Error
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "readonly") {
 		t.Fatalf("write on the read pool: got %v, want a readonly error", err)
 	}
@@ -490,11 +493,104 @@ func relativePath(t *testing.T, drv gormdb.SqliteDriver) {
 		}
 	}
 	var n int
-	if err := db.Clauses(dbresolver.Read).Raw("SELECT n FROM counter").Scan(&n).Error; err != nil {
+	if err := db.Clauses(gormdb.Read).Raw("SELECT n FROM counter").Scan(&n).Error; err != nil {
 		t.Fatalf("read: %v", err)
 	}
 	if n != 42 {
 		t.Errorf("n = %d, want 42", n)
+	}
+}
+
+// Connections open lazily: one opened after an os.Chdir must still reach the
+// file a relative path named at Open, not a file under the new directory.
+func chdirAfterOpen(t *testing.T, drv gormdb.SqliteDriver) {
+	t.Chdir(t.TempDir())
+	db := open(t, drv, gormdb.SqliteCfg{Path: "data/app.db"})
+	for _, stmt := range []string{"CREATE TABLE counter (n INTEGER)", "INSERT INTO counter VALUES (42)"} {
+		if err := db.Exec(stmt).Error; err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	t.Chdir(t.TempDir())
+	// no idle connections: every statement below opens a new one
+	readers, ok := gormdb.ReaderDB(db)
+	if !ok {
+		t.Fatal("no read pool")
+	}
+	readers.SetMaxIdleConns(0)
+	writer, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer.SetMaxIdleConns(0)
+
+	read := func(want int) {
+		t.Helper()
+		for name, q := range map[string]func() *gorm.DB{
+			"reader": func() *gorm.DB { return db.Clauses(gormdb.Read) },
+			"writer": func() *gorm.DB { return db.Clauses(gormdb.Write) },
+		} {
+			for range 3 {
+				var n int
+				if err := q().Raw("SELECT n FROM counter").Scan(&n).Error; err != nil {
+					t.Fatalf("%s read after chdir: %v", name, err)
+				}
+				if n != want {
+					t.Errorf("%s: n = %d, want %d", name, n, want)
+				}
+			}
+		}
+	}
+	read(42)
+	if err := db.Exec("UPDATE counter SET n = 43").Error; err != nil {
+		t.Fatalf("write after chdir: %v", err)
+	}
+	read(43)
+	if _, err := os.Stat("data"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a connection reached the new working directory: stat error %v", err)
+	}
+}
+
+// SqliteCfg.Pragmas reach every connection: the writer and the readers. The
+// values differ from both drivers' defaults (mattn sets synchronous=NORMAL),
+// and temp_store has no mattn DSN parameter of its own.
+func extraPragmas(t *testing.T, drv gormdb.SqliteDriver) {
+	pragmas := map[string]string{"synchronous": "EXTRA", "temp_store": "MEMORY", "cache_size": "-4000"}
+	want := map[string]string{"synchronous": "3", "temp_store": "2", "cache_size": "-4000"}
+	check := func(t *testing.T, name string, q func() *gorm.DB) {
+		t.Helper()
+		for pragma, w := range want {
+			var got string
+			if err := q().Raw("PRAGMA " + pragma).Scan(&got).Error; err != nil {
+				t.Fatalf("%s: read %s: %v", name, pragma, err)
+			}
+			if got != w {
+				t.Errorf("%s %s: got %q, want %q", name, pragma, got, w)
+			}
+		}
+	}
+
+	db := open(t, drv, gormdb.SqliteCfg{Path: filepath.Join(t.TempDir(), "test.db"), Pragmas: pragmas})
+	check(t, "writer", func() *gorm.DB { return db })
+	check(t, "reader", func() *gorm.DB { return db.Clauses(gormdb.Read) })
+	// a second reader connection, opened while the first is busy, has them too
+	rows, err := db.Clauses(gormdb.Read).Raw("SELECT 1").Rows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(t, "second reader", func() *gorm.DB { return db.Clauses(gormdb.Read) })
+	_ = rows.Close()
+
+	mem := open(t, drv, gormdb.SqliteCfg{Path: ":memory:", Pragmas: pragmas})
+	check(t, ":memory:", func() *gorm.DB { return mem })
+}
+
+// The dbresolver plugin slot is taken on a file database, as documented on
+// Open: an app's own registration fails instead of replacing the read pool.
+func ownResolverRejected(t *testing.T, drv gormdb.SqliteDriver) {
+	db := open(t, drv, gormdb.SqliteCfg{Path: filepath.Join(t.TempDir(), "test.db")})
+	if err := db.Use(dbresolver.Register(dbresolver.Config{})); !errors.Is(err, gorm.ErrRegistered) {
+		t.Errorf("db.Use(dbresolver.Register(...)): got %v, want gorm.ErrRegistered", err)
 	}
 }
 
@@ -508,7 +604,7 @@ func closeClosesReaders(t *testing.T, drv gormdb.SqliteDriver) {
 		t.Fatalf("Close: %v", err)
 	}
 	var n int
-	err = db.Clauses(dbresolver.Read).Raw("SELECT 1").Scan(&n).Error
+	err = db.Clauses(gormdb.Read).Raw("SELECT 1").Scan(&n).Error
 	if err == nil || !strings.Contains(err.Error(), "database is closed") {
 		t.Errorf("read after Close: got %v, want a closed-database error", err)
 	}
@@ -587,7 +683,7 @@ func leadingDoubleSlash(t *testing.T, drv gormdb.SqliteDriver) {
 		}
 	}
 	var n int
-	if err := db.Clauses(dbresolver.Read).Raw("SELECT n FROM counter").Scan(&n).Error; err != nil {
+	if err := db.Clauses(gormdb.Read).Raw("SELECT n FROM counter").Scan(&n).Error; err != nil {
 		t.Fatalf("read: %v", err)
 	}
 	if n != 5 {

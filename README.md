@@ -1,6 +1,6 @@
 # db
 
-GORM database helpers for Go apps: open SQLite or Postgres from one config struct, and treat both the same way.
+GORM database helpers for Go apps: open SQLite or Postgres from one config struct, with the same API and the same errors on both.
 
 [![CI](https://github.com/go-bumbu/db/actions/workflows/test.yml/badge.svg)](https://github.com/go-bumbu/db/actions/workflows/test.yml)
 [![License: LGPL-3.0](https://img.shields.io/badge/license-LGPL--3.0-blue.svg)](LICENSE)
@@ -39,7 +39,22 @@ func openDB() (*gorm.DB, error) {
 }
 ```
 
-Release it with `gormdb.Close(db)` on shutdown. Inside `db.Transaction` or `db.Connection`, use only `tx`: the SQLite writer is a single connection.
+Release it with `gormdb.Close(db)` on shutdown.
+
+### SQLite's extra rules
+
+The same code runs on SQLite and Postgres as long as it keeps to these, since the SQLite writer is a single connection:
+
+- Inside `db.Transaction` or `db.Connection`, use only `tx`; a statement on `db` waits forever.
+- SQL that depends on the connection (`last_insert_rowid()`, `changes()`, temp tables) needs a transaction or `db.Connection`.
+- `db.DB()` is the writer pool: do not tune it, and release through `gormdb.Close`.
+- `WITH ...` queries go to the writer, even read-only ones. Force a statement with `db.Clauses(gormdb.Read)` or `db.Clauses(gormdb.Write)`.
+
+Test on a temporary file with the same setup, not on `:memory:`:
+
+```go
+db := gormdbtest.Sqlite(t, sqlite.Driver{})
+```
 
 ### Detect duplicates
 
@@ -49,6 +64,11 @@ if err := db.Create(&user).Error; errors.Is(err, gorm.ErrDuplicatedKey) {
 	return ErrEmailTaken
 }
 ```
+
+### Drivers in your build
+
+- `gormdb/sqlite` (glebarez) registers the `database/sql` driver name `sqlite`, the same name as `modernc.org/sqlite`. A binary that links both panics at start-up.
+- Your binary links only the driver packages you import, but your module graph and `go.sum` list all three (glebarez, mattn and pgx), as they share one module.
 
 API reference and the routing rules for reads and writes: [pkg.go.dev/github.com/go-bumbu/db/gormdb](https://pkg.go.dev/github.com/go-bumbu/db/gormdb).
 

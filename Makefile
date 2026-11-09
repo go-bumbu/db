@@ -9,9 +9,10 @@ default: help
 test: ## run fast go tests
 	@go test ./... -cover
 
-test-all: ## run all tests incl. Postgres in Docker (integration module)
-	@TESTDBS_ALL=1 go test ./... -cover
-	@cd integration && TESTDBS_ALL=1 go test ./...
+test-integration: ## run the Postgres tests in Docker (integration module)
+	@cd integration && TESTDBS_ALL=1 go test -count=1 ./...
+
+test-all: test test-integration ## run all tests incl. Postgres in Docker
 
 lint: ## run go linter
 	# depends on https://github.com/golangci/golangci-lint
@@ -29,21 +30,36 @@ license-check: ## check for invalid licenses
 COVERAGE_THRESHOLD ?= 70
 .PHONY: coverage
 coverage: ## check code coverage per package (sqlitetest is the shared suite itself, not code to cover)
-	@out=$$(go test -cover -covermode=atomic $$(go list ./gormdb/... | grep -v /internal/sqlitetest)) || { echo "$$out"; exit 1; }; \
-	echo "$$out" | awk -v threshold=$(COVERAGE_THRESHOLD) ' \
-		/\[no test files\]/ { printf "⚠️  %-70s no test files\n", $$2; next } \
-		$$1 != "ok" && /coverage:/ { printf "⚠️  %-70s no test files\n", $$1; next } \
-		/coverage:/ { \
-			for (i = 1; i <= NF; i++) if ($$i == "coverage:") { cov = $$(i+1); sub(/%/, "", cov); break }; \
-			if (cov + 0 < threshold) { printf "❌ %-70s %s%% (below %s%%)\n", $$2, cov, threshold; fail = 1 } \
-			else { printf "✅ %-70s %s%%\n", $$2, cov } \
-		} \
-		END { exit fail }'
+	@# -coverpkg credits a package with the statements any package's tests reach,
+	@# so the core is covered by the suite the driver packages run. The per-package
+	@# figures come from the merged profile: a block counts once, hit if any run hit it.
+	@pkgs=$$(go list ./gormdb/... | grep -v /internal/sqlitetest | tr '\n' ' '); \
+	[ -n "$$pkgs" ] || { echo "coverage: no packages to test"; exit 1; }; \
+	profile=$$(mktemp) || exit 1; trap 'rm -f "$$profile"' EXIT; \
+	out=$$(go test -covermode=atomic -coverpkg="$$(echo $$pkgs | tr ' ' ',')" -coverprofile="$$profile" $$pkgs 2>&1) || { echo "$$out"; exit 1; }; \
+	awk -v threshold=$(COVERAGE_THRESHOLD) -v pkgs="$$pkgs" ' \
+		FNR == 1 { next } \
+		{ stmts[$$1] = $$2; if ($$3 > 0) hit[$$1] = 1 } \
+		END { \
+			for (block in stmts) { \
+				pkg = block; sub(/:.*/, "", pkg); sub(/\/[^\/]*$$/, "", pkg); \
+				total[pkg] += stmts[block]; if (hit[block]) covered[pkg] += stmts[block] \
+			} \
+			n = split(pkgs, list, " "); \
+			for (i = 1; i <= n; i++) { \
+				pkg = list[i]; \
+				if (!total[pkg]) { printf "⚠️  %-70s no statements\n", pkg; continue } \
+				cov = 100 * covered[pkg] / total[pkg]; \
+				if (cov < threshold) { printf "❌ %-70s %.1f%% (below %s%%)\n", pkg, cov, threshold; fail = 1 } \
+				else { printf "✅ %-70s %.1f%%\n", pkg, cov } \
+			} \
+			exit fail \
+		}' "$$profile"
 
 .PHONY: verify
-verify: ## run all checks; runs every check and fails if any fail
+verify: ## run all checks (needs Docker for the Postgres tests); runs every check and fails if any fail
 	@fail=0; \
-	for target in test license-check lint benchmark coverage; do \
+	for target in test-all license-check lint benchmark coverage; do \
 		echo "==================== make $$target ===================="; \
 		$(MAKE) --no-print-directory $$target || fail=1; \
 	done; \

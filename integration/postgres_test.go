@@ -43,7 +43,10 @@ func pgErrCode(t *testing.T, err error) string {
 	return pgErr.Code
 }
 
-func TestOpenRealPostgres(t *testing.T) {
+// postgresProvider returns the Postgres started by testdbs, and skips the test
+// when there is none.
+func postgresProvider(t *testing.T) testdbs.ConnParamsProvider {
+	t.Helper()
 	var provider testdbs.ConnParamsProvider
 	for _, target := range testdbs.DBs() {
 		if target.DbType() != testdbs.DBTypePostgres {
@@ -56,8 +59,11 @@ func TestOpenRealPostgres(t *testing.T) {
 	if provider == nil {
 		t.Skip("Postgres runs with TESTDBS_ALL=1 (Docker)")
 	}
+	return provider
+}
 
-	p := provider.ConnParamsDbName(t.Name())
+func TestOpenRealPostgres(t *testing.T) {
+	p := postgresProvider(t).ConnParamsDbName(t.Name())
 	cfg := gormdb.Cfg{Driver: gormdb.DriverPostgres, Postgres: gormdb.PostgresCfg{
 		Host: p.Host, Port: p.Port, User: p.User, Password: p.Password, DbName: p.DbName, SslMode: p.SslMode,
 		MaxOpenConns: 7, Params: map[string]string{"application_name": "gormdb test"},
@@ -68,6 +74,18 @@ func TestOpenRealPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	// Closed on every exit, so a t.Fatalf below does not leave the pool open
+	// while the container is torn down. The test closes the database itself
+	// at the end; the cleanup then has nothing left to do.
+	closed := false
+	t.Cleanup(func() {
+		if closed {
+			return
+		}
+		if err := gormdb.Close(db); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
 
 	var one int
 	if err := db.Raw("SELECT 1").Scan(&one).Error; err != nil || one != 1 {
@@ -108,6 +126,7 @@ func TestOpenRealPostgres(t *testing.T) {
 		t.Errorf("fk PgError code = %s, want 23503", code)
 	}
 
+	closed = true
 	if err := gormdb.Close(db); err != nil {
 		t.Errorf("Close: %v", err)
 	}

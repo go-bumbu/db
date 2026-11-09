@@ -21,13 +21,14 @@ Design decisions and the reasons behind them are in [AGENTS.md](AGENTS.md).
 ```sh
 make help            # list the targets
 make test            # fast tests; no Docker, Postgres tests are skipped
-make test-all        # all tests, including Postgres in Docker (TESTDBS_ALL=1)
+make test-integration # only the Postgres tests in Docker (integration/ module)
+make test-all        # make test, then make test-integration
 make lint            # golangci-lint
 make coverage        # fail if a package is below 70% coverage
-make verify          # the full check: test, license-check, lint, benchmark, coverage
+make verify          # the full check: test-all, license-check, lint, benchmark, coverage; needs Docker
 ```
 
-Run `make verify` before opening a PR. CI runs the tests, the coverage check, lint and the license check on every push to `main` and on pull requests.
+Run `make verify` before opening a PR. CI runs the tests, the coverage check, lint and the license check on every push to `main` and on pull requests, plus an `integration` job with the Postgres tests in Docker.
 
 ## Release
 

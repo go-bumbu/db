@@ -2,6 +2,7 @@ package gormdb
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -19,12 +20,21 @@ import (
 // params are the driver's reader parameters; they are copied, not changed,
 // as a driver may hand out a shared map.
 func readerDSN(path string, params url.Values) string {
-	q := url.Values{}
-	for k, v := range params {
-		q[k] = v
-	}
+	q := mergeParams(params)
 	q.Set("mode", "ro")
 	return fileDSN(path, q)
+}
+
+// mergeParams returns a new map holding the values of every set, in order. The
+// sets are not changed: a driver may hand out a shared map.
+func mergeParams(sets ...url.Values) url.Values {
+	q := url.Values{}
+	for _, set := range sets {
+		for k, v := range set {
+			q[k] = append(q[k], v...)
+		}
+	}
+	return q
 }
 
 // fileDSN builds a file: URI with an escaped path.
@@ -52,17 +62,13 @@ func busyTimeout(cfg SqliteCfg) time.Duration {
 	return min(max(cfg.BusyTimeout, time.Millisecond), maxBusyTimeout)
 }
 
-// mkdirAll creates dir and its missing parents like os.MkdirAll. The
-// function it returns removes the directories it created, so a failed Open
-// leaves nothing behind; they hold only that Open's files.
+// mkdirAll creates dir, an absolute path, and its missing parents like
+// os.MkdirAll. The function it returns removes the directories it created, so
+// a failed Open leaves nothing behind; they hold only that Open's files.
 func mkdirAll(dir string) (undo func(), err error) {
 	undo = func() {}
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		return undo, err
-	}
 	top := "" // the topmost directory that does not exist yet
-	for d := abs; ; d = filepath.Dir(d) {
+	for d := dir; ; d = filepath.Dir(d) {
 		if _, err := os.Stat(d); err == nil {
 			break
 		}
@@ -74,7 +80,7 @@ func mkdirAll(dir string) (undo func(), err error) {
 	if top != "" {
 		undo = func() { _ = os.RemoveAll(top) }
 	}
-	return undo, os.MkdirAll(abs, 0o750)
+	return undo, os.MkdirAll(dir, 0o750)
 }
 
 // openSqlite opens the writer connection (one pooled connection, WAL and
@@ -95,16 +101,28 @@ func openSqlite(cfg SqliteCfg, drv SqliteDriver, gcfg *gorm.Config) (db *gorm.DB
 	//   - _txlock=immediate: a transaction takes the write lock when it begins,
 	//     so a read-then-write transaction waits for the lock (honouring
 	//     busy_timeout) instead of failing with SQLITE_BUSY when it upgrades.
+	//   - SqliteCfg.Pragmas: the app's own, on the readers too. mattn has no
+	//     DSN parameter for an arbitrary pragma; its adapter runs them from a
+	//     connect hook, which is why the driver opens the pool (OpenDB).
 	//
 	// A file database is addressed by a file: URI with an escaped path, like
 	// the readers', so '?' or '#' in a folder name do not cut the path short.
-	params := drv.WriterParams(timeout)
+	pragmas := drv.PragmaParams(cfg.Pragmas)
+	params := mergeParams(drv.WriterParams(timeout), pragmas)
+	path := cfg.Path
 	var dsn string
 	if memory {
 		dsn = ":memory:?" + params.Encode()
 	} else {
+		// Resolved once, here: connections open lazily, so a relative path
+		// would be resolved against the working directory of the moment, and
+		// a reader or a reconnecting writer would reach another file after an
+		// os.Chdir.
+		if path, err = filepath.Abs(path); err != nil {
+			return nil, fmt.Errorf("sqlite: resolve path %s: %w", cfg.Path, err)
+		}
 		var undo func()
-		undo, err = mkdirAll(filepath.Dir(cfg.Path)) // err is the named result, seen by the defer
+		undo, err = mkdirAll(filepath.Dir(path)) // err is the named result, seen by the defer
 		defer func() {
 			if err != nil {
 				undo()
@@ -113,10 +131,10 @@ func openSqlite(cfg SqliteCfg, drv SqliteDriver, gcfg *gorm.Config) (db *gorm.DB
 		if err != nil {
 			return nil, fmt.Errorf("create sqlite directory: %w", err)
 		}
-		dsn = fileDSN(cfg.Path, params)
+		dsn = fileDSN(path, params)
 	}
 
-	writer, err := sql.Open(drv.SQLDriverName(), dsn)
+	writer, err := drv.OpenDB(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %s: %w", cfg.Path, err)
 	}
@@ -129,18 +147,13 @@ func openSqlite(cfg SqliteCfg, drv SqliteDriver, gcfg *gorm.Config) (db *gorm.DB
 		_ = writer.Close()
 		return nil, fmt.Errorf("open sqlite %s: %w", cfg.Path, err)
 	}
-
+	if err = checkWriter(writer, memory); err != nil {
+		_ = writer.Close()
+		return nil, err
+	}
 	if !memory {
-		var mode string
-		if err := writer.QueryRow("PRAGMA journal_mode=WAL").Scan(&mode); err != nil {
-			_ = writer.Close()
-			return nil, fmt.Errorf("sqlite: turn on WAL: %w", err)
-		}
-		if !strings.EqualFold(mode, "wal") {
-			_ = writer.Close()
-			return nil, fmt.Errorf("sqlite: turn on WAL: the journal mode stayed %q", mode)
-		}
-		if err = addReaders(db, writer, cfg, drv, timeout); err != nil {
+		readerParams := mergeParams(drv.ReaderParams(timeout), pragmas)
+		if err = addReaders(db, writer, path, cfg.Readers, drv, readerParams); err != nil {
 			_ = writer.Close()
 			return nil, err
 		}
@@ -148,13 +161,35 @@ func openSqlite(cfg SqliteCfg, drv SqliteDriver, gcfg *gorm.Config) (db *gorm.DB
 	return db, nil
 }
 
-// addReaders opens the read-only pool and routes reads to it.
-func addReaders(db *gorm.DB, writer *sql.DB, cfg SqliteCfg, drv SqliteDriver, timeout time.Duration) error {
-	readers, err := sql.Open(drv.SQLDriverName(), readerDSN(cfg.Path, drv.ReaderParams(timeout)))
-	if err != nil {
-		return fmt.Errorf("open sqlite readers %s: %w", cfg.Path, err)
+// checkWriter verifies what the SqliteDriver contract promises on the writer:
+// WAL for a file database, and foreign keys on.
+func checkWriter(writer *sql.DB, memory bool) error {
+	if !memory {
+		var mode string
+		if err := writer.QueryRow("PRAGMA journal_mode=WAL").Scan(&mode); err != nil {
+			return fmt.Errorf("sqlite: turn on WAL: %w", err)
+		}
+		if !strings.EqualFold(mode, "wal") {
+			return fmt.Errorf("sqlite: turn on WAL: the journal mode stayed %q", mode)
+		}
 	}
-	n := cfg.Readers
+	var fk int
+	if err := writer.QueryRow("PRAGMA foreign_keys").Scan(&fk); err != nil {
+		return fmt.Errorf("sqlite: read foreign_keys: %w", err)
+	}
+	if fk != 1 {
+		return errors.New("sqlite: foreign_keys is off on the writer: the SqliteDriver's WriterParams must turn it on (see gormdb.SqliteDriver)")
+	}
+	return nil
+}
+
+// addReaders opens the read-only pool on the database file at path, an
+// absolute path, and routes reads to it.
+func addReaders(db *gorm.DB, writer *sql.DB, path string, n int, drv SqliteDriver, params url.Values) error {
+	readers, err := drv.OpenDB(readerDSN(path, params))
+	if err != nil {
+		return fmt.Errorf("open sqlite readers %s: %w", path, err)
+	}
 	if n == 0 {
 		n = defaultSqliteReaders
 	}

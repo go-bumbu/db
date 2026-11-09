@@ -40,6 +40,17 @@ func TestValidate(t *testing.T) {
 		{name: "postgres unix socket ok", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "/var/run/postgresql", DbName: "d"}}},
 		{name: "sqlite readers with memory", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: ":memory:", Readers: 2}}, wantErr: "readers"},
 		{name: "postgres ipv6 with zone ok", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "fe80::1%eth0", DbName: "d"}}},
+		{name: "sqlite pragmas ok", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: "x.db", Pragmas: map[string]string{"synchronous": "NORMAL", "cache_size": "-20000", "temp_store": "2"}}}},
+		{name: "sqlite managed pragma", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: "x.db", Pragmas: map[string]string{"journal_mode": "DELETE"}}}, wantErr: "set by gormdb"},
+		{name: "sqlite managed pragma any case", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: "x.db", Pragmas: map[string]string{"Foreign_Keys": "0"}}}, wantErr: "set by gormdb"},
+		{name: "sqlite busy_timeout pragma", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: "x.db", Pragmas: map[string]string{"busy_timeout": "1"}}}, wantErr: "set by gormdb"},
+		{name: "sqlite locking_mode pragma", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: "x.db", Pragmas: map[string]string{"locking_mode": "EXCLUSIVE"}}}, wantErr: "set by gormdb"},
+		{name: "sqlite schema-qualified pragma", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: "x.db", Pragmas: map[string]string{"main.cache_size": "1"}}}, wantErr: "plain identifier"},
+		{name: "sqlite pragma name injection", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: "x.db", Pragmas: map[string]string{"synchronous(0)&_txlock=deferred&x": "1"}}}, wantErr: "plain identifier"},
+		{name: "sqlite pragma value injection", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: "x.db", Pragmas: map[string]string{"synchronous": "0); DROP TABLE t; --"}}}, wantErr: "not an identifier or an integer"},
+		{name: "sqlite pragma empty value", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: "x.db", Pragmas: map[string]string{"synchronous": ""}}}, wantErr: "not an identifier or an integer"},
+		{name: "sqlite pragma quoted value", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: "x.db", Pragmas: map[string]string{"synchronous": "'off'"}}}, wantErr: "not an identifier or an integer"},
+		{name: "sqlite pragma float value", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: "x.db", Pragmas: map[string]string{"cache_size": "1.5"}}}, wantErr: "not an identifier or an integer"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -154,8 +165,11 @@ func TestPostgresDSN(t *testing.T) {
 	})
 }
 
-func TestPostgresCfgRedactsPassword(t *testing.T) {
-	cfg := PostgresCfg{Host: "db", User: "app", Password: "s3cret", DbName: "app"}
+func TestPostgresCfgRedactsSecrets(t *testing.T) {
+	cfg := PostgresCfg{Host: "db", User: "app", Password: "s3cret", DbName: "app", Params: map[string]string{
+		"sslpassword":      "k3y-pass",
+		"application_name": "my-app",
+	}}
 	var buf strings.Builder
 	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", "postgres", cfg)
 	for name, out := range map[string]string{
@@ -164,11 +178,22 @@ func TestPostgresCfgRedactsPassword(t *testing.T) {
 		"%+v (Cfg)": fmt.Sprintf("%+v", Cfg{Postgres: cfg}),
 		"slog JSON": buf.String(),
 	} {
-		if strings.Contains(out, "s3cret") || !strings.Contains(out, "REDACTED") {
-			t.Errorf("%s: password not redacted: %s", name, out)
+		// every Params value is redacted, not only known secrets; the keys stay
+		for _, secret := range []string{"s3cret", "k3y-pass", "my-app"} {
+			if strings.Contains(out, secret) {
+				t.Errorf("%s: %q not redacted: %s", name, secret, out)
+			}
+		}
+		for _, want := range []string{"REDACTED", "sslpassword", "application_name"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("%s: %q missing: %s", name, want, out)
+			}
 		}
 	}
-	if cfg.Password != "s3cret" {
+	if cfg.Password != "s3cret" || cfg.Params["sslpassword"] != "k3y-pass" {
 		t.Error("redacting changed the config itself")
+	}
+	if got := fmt.Sprintf("%v", PostgresCfg{Host: "db"}); strings.Contains(got, "REDACTED") {
+		t.Errorf("empty Password and Params shown as redacted: %s", got)
 	}
 }

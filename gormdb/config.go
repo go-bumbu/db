@@ -4,15 +4,18 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"net/netip"
 	"net/url"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	gormlogger "gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
 )
 
 // Supported drivers.
@@ -34,6 +37,13 @@ const (
 
 // Cfg selects and configures the database. Only the section matching Driver
 // is used.
+//
+// Logger, NamingStrategy, NowFunc and SkipDefaultTransaction are set in code,
+// not loaded from a config file; they are passed to gorm.Config as they are.
+// gorm.Config's PrepareStmt is deliberately not offered: it swaps the
+// connection pools for prepared-statement wrappers, which interacts with
+// dbresolver's own prepared-statement store and with the wrapper that keeps a
+// db.Connection on its connection, a combination gormdb does not test.
 type Cfg struct {
 	// Driver is DriverSqlite or DriverPostgres.
 	Driver   string
@@ -41,6 +51,15 @@ type Cfg struct {
 	Postgres PostgresCfg
 	// Logger receives GORM's log output; nil keeps GORM's default logger.
 	Logger gormlogger.Interface
+	// NamingStrategy maps structs and fields to table and column names; nil
+	// keeps GORM's default (snake_case, plural table names).
+	NamingStrategy schema.Namer
+	// NowFunc returns the time GORM writes to CreatedAt and UpdatedAt; nil
+	// keeps GORM's default, the local time.
+	NowFunc func() time.Time
+	// SkipDefaultTransaction stops GORM from wrapping each Create, Update and
+	// Delete in a transaction of its own.
+	SkipDefaultTransaction bool
 }
 
 // SqliteCfg configures a SQLite database file.
@@ -59,10 +78,33 @@ type SqliteCfg struct {
 	// Readers is the size of the read-only connection pool; zero means 10.
 	// ":memory:" has no read pool, so it must stay zero there.
 	Readers int
+	// Pragmas are extra pragmas, name to value, such as "synchronous":
+	// "NORMAL" or "cache_size": "-20000". Every connection runs them, the
+	// writer and each reader, as most pragmas are per-connection settings; a
+	// db.Exec("PRAGMA ...") would reach a single pooled connection. A name is
+	// a plain identifier and a value an identifier or an integer, so nothing
+	// else can reach the DSN. busy_timeout, foreign_keys, journal_mode and
+	// locking_mode are rejected: Open and the drivers set them. A pragma that
+	// writes to the database file (user_version, application_id) fails on
+	// the read-only readers; run it once with db.Exec.
+	Pragmas map[string]string
 }
 
+// managedPragmas are the pragmas Open and the drivers set on every connection:
+// busy_timeout, foreign_keys and journal_mode from SqliteCfg and the driver
+// contract, locking_mode by mattn (NORMAL; EXCLUSIVE would shut the readers
+// out).
+var managedPragmas = []string{"busy_timeout", "foreign_keys", "journal_mode", "locking_mode"}
+
+var (
+	pragmaName  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	pragmaValue = regexp.MustCompile(`^(-?[0-9]+|[A-Za-z_][A-Za-z0-9_]*)$`)
+)
+
 // PostgresCfg configures a Postgres connection. Printing it with fmt, or
-// logging it with slog, shows Password as "REDACTED".
+// logging it with slog, shows Password and every Params value as "REDACTED"
+// (the Params keys stay visible): a parameter such as sslpassword can hold a
+// secret.
 type PostgresCfg struct {
 	// Host is a host name, an IP address or the directory of a Unix socket,
 	// without a port (see Port) and, for IPv6, without brackets.
@@ -139,21 +181,33 @@ func (c PostgresCfg) DSN() string {
 	return u.String()
 }
 
-// String shows the configuration with Password redacted.
+// String shows the configuration with Password and the Params values
+// redacted.
 func (c PostgresCfg) String() string {
 	type plain PostgresCfg // without the String method
 	return fmt.Sprintf("%+v", plain(c.redacted()))
 }
 
-// LogValue shows the configuration in slog with Password redacted.
+// LogValue shows the configuration in slog with Password and the Params
+// values redacted.
 func (c PostgresCfg) LogValue() slog.Value {
 	type plain PostgresCfg // without the LogValue method
 	return slog.AnyValue(plain(c.redacted()))
 }
 
+// redacted returns a copy with Password and every Params value replaced; any
+// parameter may carry a secret, so none is shown.
 func (c PostgresCfg) redacted() PostgresCfg {
+	const redacted = "REDACTED"
 	if c.Password != "" {
-		c.Password = "REDACTED"
+		c.Password = redacted
+	}
+	if c.Params != nil {
+		params := make(map[string]string, len(c.Params))
+		for k := range c.Params {
+			params[k] = redacted
+		}
+		c.Params = params
 	}
 	return c
 }
@@ -183,6 +237,23 @@ func (c SqliteCfg) validate() error {
 		return errors.New(`sqlite: readers must be zero for ":memory:", which has no read pool`)
 	case c.BusyTimeout < 0:
 		return errors.New("sqlite: busy timeout must not be negative")
+	}
+	return validatePragmas(c.Pragmas)
+}
+
+// validatePragmas rejects a pragma Open manages and anything but a plain name
+// and value, as both are written into the DSN and run as SQL.
+func validatePragmas(pragmas map[string]string) error {
+	for _, name := range slices.Sorted(maps.Keys(pragmas)) {
+		value := pragmas[name]
+		switch {
+		case !pragmaName.MatchString(name):
+			return fmt.Errorf("sqlite: pragma name %q is not a plain identifier", name)
+		case slices.Contains(managedPragmas, strings.ToLower(name)):
+			return fmt.Errorf("sqlite: pragma %q is set by gormdb and cannot be changed in Pragmas", name)
+		case !pragmaValue.MatchString(value):
+			return fmt.Errorf("sqlite: pragma %s value %q is not an identifier or an integer", name, value)
+		}
 	}
 	return nil
 }
