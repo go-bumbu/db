@@ -1,15 +1,19 @@
 package sqlitetest
 
 import (
+	"bytes"
 	"errors"
+	stdlog "log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-bumbu/db/gormdb"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 	"gorm.io/plugin/dbresolver"
 )
 
@@ -127,5 +131,36 @@ func closeWaitsForReads(t *testing.T, drv gormdb.SqliteDriver) {
 	}
 	if _, err := os.Stat(path + "-wal"); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the -wal file survived Close: stat error %v", err)
+	}
+}
+
+// A BusyTimeout SQLite cannot store (over 2^31-1 ms) must not become 0
+// either: it is capped.
+func hugeBusyTimeout(t *testing.T, drv gormdb.SqliteDriver) {
+	db := open(t, drv, gormdb.SqliteCfg{Path: filepath.Join(t.TempDir(), "test.db"), BusyTimeout: 25 * 24 * time.Hour})
+	var got string
+	if err := db.Raw("PRAGMA busy_timeout").Scan(&got).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got != "2147483647" {
+		t.Errorf("busy_timeout: got %q, want 2147483647", got)
+	}
+}
+
+// Setting up the read pool must not log library internals through the app's
+// logger.
+func quietOpen(t *testing.T, drv gormdb.SqliteDriver) {
+	var buf bytes.Buffer
+	log := logger.New(stdlog.New(&buf, "", 0), logger.Config{LogLevel: logger.Info})
+	cfg := gormdb.Cfg{Driver: gormdb.DriverSqlite, Sqlite: gormdb.SqliteCfg{Path: filepath.Join(t.TempDir(), "test.db")}, Logger: log}
+	db, err := gormdb.Open(cfg, gormdb.Drivers{Sqlite: drv})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := gormdb.Close(db); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	if strings.Contains(buf.String(), "callback") {
+		t.Errorf("Open logged callback set-up:\n%s", buf.String())
 	}
 }

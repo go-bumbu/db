@@ -42,6 +42,8 @@ func Run(t *testing.T, drv gormdb.SqliteDriver) {
 	t.Run("close waits for reads", func(t *testing.T) { closeWaitsForReads(t, drv) })
 	t.Run("connection stays pinned", func(t *testing.T) { connectionStaysPinned(t, drv) })
 	t.Run("sub-millisecond busy timeout", func(t *testing.T) { subMillisecondBusyTimeout(t, drv) })
+	t.Run("huge busy timeout", func(t *testing.T) { hugeBusyTimeout(t, drv) })
+	t.Run("quiet open", func(t *testing.T) { quietOpen(t, drv) })
 	// not parallel: t.Chdir changes the process working directory
 	t.Run("file named :memory:", func(t *testing.T) { memoryNamedFile(t, drv) })
 	t.Run("in-memory close", func(t *testing.T) { inMemoryClose(t, drv) })

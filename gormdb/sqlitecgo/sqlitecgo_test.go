@@ -11,7 +11,7 @@ import (
 func TestSuite(t *testing.T) { sqlitetest.Run(t, sqlitecgo.Driver{}) }
 
 func TestParams(t *testing.T) {
-	w := sqlitecgo.Driver{}.Params(3*time.Second, true)
+	w := sqlitecgo.Driver{}.WriterParams(3 * time.Second)
 	for k, want := range map[string]string{
 		"_busy_timeout": "3000",
 		"_foreign_keys": "1",
@@ -23,7 +23,7 @@ func TestParams(t *testing.T) {
 		}
 	}
 
-	r := sqlitecgo.Driver{}.Params(3*time.Second, false)
+	r := sqlitecgo.Driver{}.ReaderParams(3 * time.Second)
 	for k, want := range map[string]string{
 		"_busy_timeout": "3000",
 		"_foreign_keys": "1",

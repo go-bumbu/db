@@ -19,10 +19,12 @@ type SqliteDriver interface {
 	// SQLDriverName is the database/sql driver name: "sqlite" (glebarez),
 	// "sqlite3" (mattn).
 	SQLDriverName() string
-	// Params returns the DSN query parameters in the driver's own format.
-	// The writer gets busy timeout, foreign keys, WAL and an immediate
-	// transaction lock; a reader gets busy timeout and foreign keys only.
-	Params(busyTimeout time.Duration, writer bool) url.Values
+	// WriterParams returns the writer's DSN query parameters in the driver's
+	// own format: busy timeout, foreign keys, WAL and an immediate
+	// transaction lock. ReaderParams returns a reader's: busy timeout and
+	// foreign keys only. Each call returns a map the caller may keep.
+	WriterParams(busyTimeout time.Duration) url.Values
+	ReaderParams(busyTimeout time.Duration) url.Values
 	// Dialector wraps an open connection pool. Translate must keep the
 	// original error.
 	Dialector(conn gorm.ConnPool) gorm.Dialector

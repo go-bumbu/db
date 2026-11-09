@@ -9,12 +9,14 @@ default: help
 test: ## run fast go tests
 	@go test ./... -cover
 
-test-all: ## run all tests incl. Postgres in Docker
+test-all: ## run all tests incl. Postgres in Docker (integration module)
 	@TESTDBS_ALL=1 go test ./... -cover
+	@cd integration && TESTDBS_ALL=1 go test ./...
 
 lint: ## run go linter
 	# depends on https://github.com/golangci/golangci-lint
 	@golangci-lint run
+	@cd integration && golangci-lint run --config ../.golangci.yaml
 
 benchmark: ## run go benchmarks
 	@go test -run=^$$ -bench=. ./...
@@ -26,8 +28,8 @@ license-check: ## check for invalid licenses
 
 COVERAGE_THRESHOLD ?= 70
 .PHONY: coverage
-coverage: ## check code coverage per package
-	@out=$$(go test -cover -covermode=atomic $$(go list ./gormdb/...)) || { echo "$$out"; exit 1; }; \
+coverage: ## check code coverage per package (sqlitetest is the shared suite itself, not code to cover)
+	@out=$$(go test -cover -covermode=atomic $$(go list ./gormdb/... | grep -v /internal/sqlitetest)) || { echo "$$out"; exit 1; }; \
 	echo "$$out" | awk -v threshold=$(COVERAGE_THRESHOLD) ' \
 		/\[no test files\]/ { printf "⚠️  %-70s no test files\n", $$2; next } \
 		$$1 != "ok" && /coverage:/ { printf "⚠️  %-70s no test files\n", $$1; next } \

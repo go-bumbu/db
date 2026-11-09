@@ -1,6 +1,8 @@
 package gormdb
 
 import (
+	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"testing"
@@ -28,6 +30,15 @@ func TestValidate(t *testing.T) {
 		{name: "postgres host with port", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "db:5433", DbName: "d"}}, wantErr: "port"},
 		{name: "postgres bracketed ipv6", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "[::1]", DbName: "d"}}, wantErr: "port"},
 		{name: "postgres ipv6 ok", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "::1", DbName: "d"}}},
+		{name: "postgres port out of range", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "h", Port: 70000, DbName: "d"}}, wantErr: "port"},
+		{name: "postgres negative port", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "h", Port: -1, DbName: "d"}}, wantErr: "port"},
+		{name: "postgres unknown sslmode", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "h", DbName: "d", SslMode: "disabled"}}, wantErr: "sslmode"},
+		{name: "postgres negative connect timeout", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "h", DbName: "d", ConnectTimeout: -time.Second}}, wantErr: "connect timeout"},
+		{name: "postgres negative pool", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "h", DbName: "d", MaxOpenConns: -1}}, wantErr: "pool"},
+		{name: "postgres reserved param", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "h", DbName: "d", Params: map[string]string{"SSLMode": "disable"}}}, wantErr: "own field"},
+		{name: "postgres params ok", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "h", DbName: "d", SslMode: "verify-full", Params: map[string]string{"application_name": "app"}}}},
+		{name: "postgres unix socket ok", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "/var/run/postgresql", DbName: "d"}}},
+		{name: "sqlite readers with memory", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: ":memory:", Readers: 2}}, wantErr: "readers"},
 		{name: "postgres ipv6 with zone ok", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "fe80::1%eth0", DbName: "d"}}},
 	}
 	for _, tc := range tests {
@@ -49,7 +60,7 @@ func TestValidate(t *testing.T) {
 func TestPostgresDSN(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		got := PostgresCfg{Host: "db", User: "app", Password: "pw", DbName: "app"}.DSN()
-		want := "postgres://app:pw@db:5432/app?sslmode=require" //nolint:gosec // G101: fake test credentials
+		want := "postgres://app:pw@db:5432/app?connect_timeout=10&sslmode=require" //nolint:gosec // G101: fake test credentials
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
 		}
@@ -74,7 +85,7 @@ func TestPostgresDSN(t *testing.T) {
 
 	t.Run("ipv6 host without user", func(t *testing.T) {
 		got := PostgresCfg{Host: "::1", DbName: "app"}.DSN()
-		want := "postgres://[::1]:5432/app?sslmode=require"
+		want := "postgres://[::1]:5432/app?connect_timeout=10&sslmode=require"
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
 		}
@@ -105,7 +116,7 @@ func TestPostgresDSN(t *testing.T) {
 
 	t.Run("empty user leaves user out", func(t *testing.T) {
 		got := PostgresCfg{Host: "db", DbName: "app"}.DSN()
-		want := "postgres://db:5432/app?sslmode=require"
+		want := "postgres://db:5432/app?connect_timeout=10&sslmode=require"
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
 		}
@@ -113,9 +124,51 @@ func TestPostgresDSN(t *testing.T) {
 
 	t.Run("password without user is kept", func(t *testing.T) {
 		got := PostgresCfg{Host: "db", Password: "p@ss&w", DbName: "app"}.DSN()
-		want := "postgres://db:5432/app?password=p%40ss%26w&sslmode=require"
+		want := "postgres://db:5432/app?connect_timeout=10&password=p%40ss%26w&sslmode=require"
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
 		}
 	})
+
+	t.Run("connect timeout is rounded up to seconds", func(t *testing.T) {
+		u, err := url.Parse(PostgresCfg{Host: "db", DbName: "app", ConnectTimeout: 1500 * time.Millisecond}.DSN())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := u.Query().Get("connect_timeout"); got != "2" {
+			t.Errorf("connect_timeout: got %q, want 2", got)
+		}
+	})
+
+	t.Run("params are added, fields win", func(t *testing.T) {
+		u, err := url.Parse(PostgresCfg{Host: "db", DbName: "app", Params: map[string]string{"application_name": "my app"}}.DSN())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := u.Query().Get("application_name"); got != "my app" {
+			t.Errorf("application_name: got %q, want %q", got, "my app")
+		}
+		if strings.Contains(u.RawQuery, "+") {
+			t.Errorf("query %q encodes a space as '+', which libpq reads as a '+'", u.RawQuery)
+		}
+	})
+}
+
+func TestPostgresCfgRedactsPassword(t *testing.T) {
+	cfg := PostgresCfg{Host: "db", User: "app", Password: "s3cret", DbName: "app"}
+	var buf strings.Builder
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", "postgres", cfg)
+	for name, out := range map[string]string{
+		"%v":        fmt.Sprintf("%v", cfg),
+		"%+v":       fmt.Sprintf("%+v", cfg),
+		"%+v (Cfg)": fmt.Sprintf("%+v", Cfg{Postgres: cfg}),
+		"slog JSON": buf.String(),
+	} {
+		if strings.Contains(out, "s3cret") || !strings.Contains(out, "REDACTED") {
+			t.Errorf("%s: password not redacted: %s", name, out)
+		}
+	}
+	if cfg.Password != "s3cret" {
+		t.Error("redacting changed the config itself")
+	}
 }

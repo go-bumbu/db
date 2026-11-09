@@ -23,11 +23,6 @@ const (
 // which constraint failed. An error that is already translated, or whose code
 // has no sentinel, is returned unchanged.
 func Translate(err error, extendedCode int) error {
-	for _, s := range []error{gorm.ErrDuplicatedKey, gorm.ErrForeignKeyViolated, gorm.ErrCheckConstraintViolated} {
-		if errors.Is(err, s) {
-			return err // already translated: do not wrap the sentinel twice
-		}
-	}
 	var sentinel error
 	switch extendedCode {
 	case constraintUnique, constraintPrimaryKey:
@@ -38,6 +33,9 @@ func Translate(err error, extendedCode int) error {
 		sentinel = gorm.ErrCheckConstraintViolated
 	default:
 		return err
+	}
+	if errors.Is(err, sentinel) {
+		return err // already translated: do not wrap the sentinel twice
 	}
 	return fmt.Errorf("%w: %w", sentinel, err)
 }

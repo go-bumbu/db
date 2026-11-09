@@ -2,7 +2,9 @@
 
 ## Overview
 
-All code lives under `gormdb/`. The core package (`gormdb/`) holds the config, `Open`/`Close` and the SQLite writer/reader model, and imports no database driver. Each driver is a subpackage: `gormdb/sqlite` (glebarez, pure Go), `gormdb/sqlitecgo` (mattn, CGO) and `gormdb/postgres` (pgx). Both SQLite drivers run the shared behaviour suite in `gormdb/internal/sqlitetest`.
+All code lives under `gormdb/`. The core package (`gormdb/`) holds the config, `Open`/`Close` and the SQLite writer/reader model, and imports no database driver. Each driver is a subpackage: `gormdb/sqlite` (glebarez, pure Go), `gormdb/sqlitecgo` (mattn, CGO) and `gormdb/postgres` (pgx). Both SQLite drivers run the shared behaviour suite in `gormdb/internal/sqlitetest`. `gormdb/gormdbtest` opens a temp-file SQLite database for apps' tests.
+
+The tests against a real Postgres in Docker live in `integration/`, a module of its own (with a `replace` to the parent), so testcontainers and Docker never reach the library's `go.mod` or the apps that import it. `make test-all` and `make lint` include it; `go test ./...` at the root does not.
 
 Design decisions and the reasons behind them are in [AGENTS.md](AGENTS.md).
 
@@ -10,7 +12,7 @@ Design decisions and the reasons behind them are in [AGENTS.md](AGENTS.md).
 
 - Go 1.26 or newer (see `go.mod`)
 - A C compiler (gcc) for `gormdb/sqlitecgo`, with `CGO_ENABLED=1`
-- Docker, for the Postgres tests in `make test-all`
+- Docker, for the Postgres tests in `make test-all` (the `integration/` module)
 - [golangci-lint](https://github.com/golangci/golangci-lint) v2 for `make lint`
 - [go-licence-detector](https://github.com/elastic/go-licence-detector) for `make license-check`
 

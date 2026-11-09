@@ -12,7 +12,7 @@ import (
 func TestSuite(t *testing.T) { sqlitetest.Run(t, sqlite.Driver{}) }
 
 func TestParams(t *testing.T) {
-	w := sqlite.Driver{}.Params(3*time.Second, true)
+	w := sqlite.Driver{}.WriterParams(3 * time.Second)
 	wantW := []string{"busy_timeout(3000)", "journal_mode(WAL)", "foreign_keys(1)"}
 	if got := w["_pragma"]; !slices.Equal(got, wantW) {
 		t.Errorf("writer pragmas = %v, want %v", got, wantW)
@@ -21,7 +21,7 @@ func TestParams(t *testing.T) {
 		t.Errorf("writer _txlock = %q, want immediate", got)
 	}
 
-	r := sqlite.Driver{}.Params(3*time.Second, false)
+	r := sqlite.Driver{}.ReaderParams(3 * time.Second)
 	wantR := []string{"busy_timeout(3000)", "foreign_keys(1)"}
 	if got := r["_pragma"]; !slices.Equal(got, wantR) {
 		t.Errorf("reader pragmas = %v, want %v", got, wantR)

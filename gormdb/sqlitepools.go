@@ -8,15 +8,17 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 const (
 	sqlitePoolsName = "gormdb:sqlite_pools"
 	resolverName    = "gorm:db_resolver"
-	// readerDrainTimeout bounds how long Close waits for reads still running,
-	// so rows a caller never closes cannot hang it.
-	readerDrainTimeout = 5 * time.Second
 )
+
+// readerDrainTimeout bounds how long Close waits for reads still running, so
+// rows a caller never closes cannot hang it. A variable so tests can shorten it.
+var readerDrainTimeout = 5 * time.Second
 
 // sqlitePools is a GORM plugin on a SQLite file database. It holds the writer
 // and read-only pools, so Close finds and releases them in order without any
@@ -36,7 +38,13 @@ func (*sqlitePools) Name() string { return sqlitePoolsName }
 // waits forever for the very connection the callback holds, and a read would
 // not see the pinned connection's temp tables. Its callbacks are wrapped to
 // skip a pinned connection, so everything inside db.Connection stays on it.
+//
+// Replacing a callback logs an Info line through the app's logger; it is
+// silenced while the plugin is set up, as it says nothing about the app.
 func (*sqlitePools) Initialize(db *gorm.DB) error {
+	saved := db.Logger
+	db.Logger = logger.Discard
+	defer func() { db.Logger = saved }()
 	cb := db.Callback()
 	wrap := func(get func(string) func(*gorm.DB), replace func(string, func(*gorm.DB)) error) error {
 		resolve := get(resolverName)
@@ -65,8 +73,11 @@ func (*sqlitePools) Initialize(db *gorm.DB) error {
 
 // close closes the readers, waits for reads still running, then closes the
 // writer: while a reader connection is open, closing the writer skips the WAL
-// checkpoint and leaves the data in the -wal file. Concurrent and repeated
-// calls run one after the other; sql.DB.Close is idempotent.
+// checkpoint and leaves the data in the -wal file. A read still running after
+// readerDrainTimeout (rows never closed) is reported as an error, with the
+// writer closed anyway and the -wal file left behind; the data is safe as
+// long as that file stays next to the database. Concurrent and repeated calls
+// run one after the other; sql.DB.Close is idempotent.
 func (p *sqlitePools) close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -76,6 +87,9 @@ func (p *sqlitePools) close() error {
 	deadline := time.Now().Add(readerDrainTimeout)
 	for p.readers.Stats().OpenConnections > 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
+	}
+	if n := p.readers.Stats().OpenConnections; n > 0 {
+		err = errors.Join(err, fmt.Errorf("gormdb: %d reader connections still open after %s (rows not closed?); the WAL was not checkpointed", n, readerDrainTimeout))
 	}
 	return errors.Join(err, p.writer.Close())
 }

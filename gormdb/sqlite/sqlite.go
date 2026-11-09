@@ -21,18 +21,21 @@ var _ gormdb.SqliteDriver = Driver{}
 // SQLDriverName returns the database/sql driver name glebarez registers.
 func (Driver) SQLDriverName() string { return "sqlite" }
 
-// Params returns the DSN query parameters in glebarez's format.
-func (Driver) Params(busyTimeout time.Duration, writer bool) url.Values {
-	pragmas := []string{fmt.Sprintf("busy_timeout(%d)", busyTimeout.Milliseconds())}
-	if writer {
-		pragmas = append(pragmas, "journal_mode(WAL)")
+// WriterParams returns the writer's DSN query parameters in glebarez's format.
+func (Driver) WriterParams(busyTimeout time.Duration) url.Values {
+	return url.Values{
+		"_pragma": {busyTimeoutPragma(busyTimeout), "journal_mode(WAL)", "foreign_keys(1)"},
+		"_txlock": {"immediate"},
 	}
-	pragmas = append(pragmas, "foreign_keys(1)")
-	q := url.Values{"_pragma": pragmas}
-	if writer {
-		q.Set("_txlock", "immediate")
-	}
-	return q
+}
+
+// ReaderParams returns a reader's DSN query parameters in glebarez's format.
+func (Driver) ReaderParams(busyTimeout time.Duration) url.Values {
+	return url.Values{"_pragma": {busyTimeoutPragma(busyTimeout), "foreign_keys(1)"}}
+}
+
+func busyTimeoutPragma(d time.Duration) string {
+	return fmt.Sprintf("busy_timeout(%d)", d.Milliseconds())
 }
 
 // Dialector wraps an open connection pool.
