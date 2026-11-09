@@ -39,6 +39,11 @@ func Run(t *testing.T, drv gormdb.SqliteDriver) {
 	t.Run("file URI rejected", func(t *testing.T) { fileURIRejected(t, drv) })
 	t.Run("leading double slash", func(t *testing.T) { leadingDoubleSlash(t, drv) })
 	t.Run("close twice", func(t *testing.T) { closeTwice(t, drv) })
+	t.Run("close waits for reads", func(t *testing.T) { closeWaitsForReads(t, drv) })
+	t.Run("connection stays pinned", func(t *testing.T) { connectionStaysPinned(t, drv) })
+	t.Run("sub-millisecond busy timeout", func(t *testing.T) { subMillisecondBusyTimeout(t, drv) })
+	// not parallel: t.Chdir changes the process working directory
+	t.Run("file named :memory:", func(t *testing.T) { memoryNamedFile(t, drv) })
 	t.Run("in-memory close", func(t *testing.T) { inMemoryClose(t, drv) })
 	t.Run("duplicate keeps original", func(t *testing.T) { duplicateKeepsOriginal(t, drv) })
 	t.Run("primary key duplicate", func(t *testing.T) { primaryKeyDuplicate(t, drv) })

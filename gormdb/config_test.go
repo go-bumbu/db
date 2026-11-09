@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidate(t *testing.T) {
@@ -23,6 +24,11 @@ func TestValidate(t *testing.T) {
 		{name: "sqlite zero readers ok", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: "x.db", Readers: 0}}},
 		{name: "postgres without host", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{DbName: "d"}}, wantErr: "host"},
 		{name: "postgres without db", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "h"}}, wantErr: "database name"},
+		{name: "sqlite negative busy timeout", cfg: Cfg{Driver: DriverSqlite, Sqlite: SqliteCfg{Path: "x.db", BusyTimeout: -time.Second}}, wantErr: "busy timeout"},
+		{name: "postgres host with port", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "db:5433", DbName: "d"}}, wantErr: "port"},
+		{name: "postgres bracketed ipv6", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "[::1]", DbName: "d"}}, wantErr: "port"},
+		{name: "postgres ipv6 ok", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "::1", DbName: "d"}}},
+		{name: "postgres ipv6 with zone ok", cfg: Cfg{Driver: DriverPostgres, Postgres: PostgresCfg{Host: "fe80::1%eth0", DbName: "d"}}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -100,6 +106,14 @@ func TestPostgresDSN(t *testing.T) {
 	t.Run("empty user leaves user out", func(t *testing.T) {
 		got := PostgresCfg{Host: "db", DbName: "app"}.DSN()
 		want := "postgres://db:5432/app?sslmode=require"
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("password without user is kept", func(t *testing.T) {
+		got := PostgresCfg{Host: "db", Password: "p@ss&w", DbName: "app"}.DSN()
+		want := "postgres://db:5432/app?password=p%40ss%26w&sslmode=require"
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
 		}

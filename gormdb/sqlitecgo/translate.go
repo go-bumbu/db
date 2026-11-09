@@ -2,10 +2,9 @@ package sqlitecgo
 
 import (
 	"errors"
-	"fmt"
 
+	"github.com/go-bumbu/db/gormdb/internal/sqliteerr"
 	"github.com/mattn/go-sqlite3"
-	"gorm.io/gorm"
 )
 
 // Translate maps SQLite constraint errors to gorm's sentinel errors. Unlike
@@ -17,22 +16,5 @@ func (dialector) Translate(err error) error {
 	if !errors.As(err, &se) {
 		return err
 	}
-	var sentinel error
-	// already translated: do not wrap the sentinel twice
-	for _, s := range []error{gorm.ErrDuplicatedKey, gorm.ErrForeignKeyViolated, gorm.ErrCheckConstraintViolated} {
-		if errors.Is(err, s) {
-			return err
-		}
-	}
-	switch se.ExtendedCode {
-	case sqlite3.ErrConstraintUnique, sqlite3.ErrConstraintPrimaryKey:
-		sentinel = gorm.ErrDuplicatedKey
-	case sqlite3.ErrConstraintForeignKey:
-		sentinel = gorm.ErrForeignKeyViolated
-	case sqlite3.ErrConstraintCheck:
-		sentinel = gorm.ErrCheckConstraintViolated
-	default:
-		return err
-	}
-	return fmt.Errorf("%w: %w", sentinel, err)
+	return sqliteerr.Translate(err, int(se.ExtendedCode))
 }

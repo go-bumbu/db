@@ -39,7 +39,7 @@ func openDB() (*gorm.DB, error) {
 }
 ```
 
-Release it with `gormdb.Close(db)` on shutdown. Inside `db.Transaction`, use only `tx`: the SQLite writer is a single connection.
+Release it with `gormdb.Close(db)` on shutdown. Inside `db.Transaction` or `db.Connection`, use only `tx`: the SQLite writer is a single connection.
 
 ### Detect duplicates
 

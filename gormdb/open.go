@@ -1,7 +1,6 @@
 package gormdb
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 
@@ -27,14 +26,17 @@ import (
 // db.Clauses(dbresolver.Read) forces a statement onto the read pool,
 // db.Clauses(dbresolver.Write) onto the writer. SQL that depends on the
 // connection (SELECT last_insert_rowid(), changes(), temp tables) must run
-// with db.Clauses(dbresolver.Write), or in a transaction, because a bare
-// SELECT lands on another, read-only connection.
+// with db.Clauses(dbresolver.Write), in a transaction, or in db.Connection,
+// because a bare SELECT lands on another, read-only connection. Inside
+// db.Transaction and db.Connection every statement on tx stays on the
+// connection they hold, the writer, reads included.
 //
-// Inside db.Transaction, use only tx: the single writer connection is held by
-// the transaction, so a statement on db that reaches the writer waits for it
-// forever (a deadlock). For ":memory:", which uses one connection for
-// everything and has no read pool, any statement on db inside a transaction
-// deadlocks, reads included, though the same code works on a file database.
+// Inside db.Transaction or db.Connection, use only tx: the single writer
+// connection is held by the callback, so a statement on db that reaches the
+// writer waits for it forever (a deadlock). For ":memory:", which uses one
+// connection for everything and has no read pool, any statement on db inside
+// the callback deadlocks, reads included, though the same code works on a
+// file database.
 //
 // WAL does not work on network filesystems: keep the database on a local
 // disk. Copying a database file also needs its -wal file, or the latest
@@ -68,21 +70,22 @@ func missingDriver(driver string) error {
 }
 
 // Close releases the database's connections, the read-only pool included. It
-// is safe to call more than once. Always release through Close:
-// db.DB().Close() leaks the reader pool and its registry entry.
+// is safe to call more than once, and from several goroutines. Always release
+// through Close: db.DB().Close() leaves the reader pool open.
+//
+// For a SQLite file database Close closes the readers first and waits for
+// reads still running (up to 5s, in case rows are never closed) before it
+// closes the writer, so the writer can checkpoint and remove the -wal file.
 func Close(db *gorm.DB) error {
 	if db == nil {
 		return errors.New("gormdb: Close of a nil database")
+	}
+	if pools, ok := db.Plugins[sqlitePoolsName].(*sqlitePools); ok {
+		return pools.close()
 	}
 	sqlDB, err := db.DB()
 	if err != nil {
 		return err
 	}
-	// The readers close first: while one is open, closing the writer skips the
-	// WAL checkpoint and leaves the data in the -wal file. LoadAndDelete decides
-	// who closes the readers, so concurrent or repeated calls close them once.
-	if readers, ok := readerPools.LoadAndDelete(sqlDB); ok {
-		err = readers.(*sql.DB).Close()
-	}
-	return errors.Join(err, sqlDB.Close())
+	return sqlDB.Close()
 }

@@ -7,54 +7,56 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/plugin/dbresolver"
 )
 
-// readerPools maps a writer pool to its read-only pool, so Close can release
-// both. It is a registry rather than a wrapper type because Open returns a
-// plain *gorm.DB.
-var readerPools sync.Map // *sql.DB -> *sql.DB
-
 // readerDSN returns the DSN of a read-only connection to the database file at
 // path. It is always a file: URI, as only a URI can say mode=ro, so path is
 // escaped: characters such as '?', '#' and '%' mean something in a URI.
-// params are the driver's reader parameters.
+// params are the driver's reader parameters; readerDSN adds mode=ro to them.
 func readerDSN(path string, params url.Values) string {
-	q := url.Values{}
-	for k, v := range params {
-		q[k] = append([]string(nil), v...)
-	}
-	q.Set("mode", "ro")
-	return fileDSN(path, q)
+	params.Set("mode", "ro")
+	return fileDSN(path, params)
 }
 
 // fileDSN builds a file: URI with an escaped path.
 func fileDSN(path string, params url.Values) string {
 	// Clean: a leading "//" would otherwise read as a URI authority
-	return "file:" + (&url.URL{Path: filepath.Clean(path)}).EscapedPath() + "?" + params.Encode()
+	p := filepath.Clean(path)
+	if p == ":memory:" {
+		// "./:memory:" is a file named ":memory:"; once cleaned, SQLite would
+		// read it as an in-memory database
+		p = "./" + p
+	}
+	return "file:" + (&url.URL{Path: p}).EscapedPath() + "?" + params.Encode()
 }
 
 // isMemory reports whether path names an in-memory database.
 func isMemory(path string) bool { return path == ":memory:" }
 
+// busyTimeout returns the busy timeout to use for cfg: the default for zero,
+// and at least a millisecond, since SQLite counts in whole milliseconds and 0
+// turns waiting off.
+func busyTimeout(cfg SqliteCfg) time.Duration {
+	switch {
+	case cfg.BusyTimeout == 0:
+		return defaultBusyTimeout
+	case cfg.BusyTimeout < time.Millisecond:
+		return time.Millisecond
+	default:
+		return cfg.BusyTimeout
+	}
+}
+
 // openSqlite opens the writer connection (one pooled connection, WAL and
 // immediate transactions) and, for a file database, a pool of read-only
 // connections that dbresolver routes reads to.
 func openSqlite(cfg SqliteCfg, drv SqliteDriver, gcfg *gorm.Config) (*gorm.DB, error) {
-	timeout := cfg.BusyTimeout
-	if timeout <= 0 {
-		timeout = defaultBusyTimeout
-	}
+	timeout := busyTimeout(cfg)
 	memory := isMemory(cfg.Path)
-	if !memory {
-		if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o750); err != nil {
-			return nil, fmt.Errorf("create sqlite directory: %w", err)
-		}
-	}
 
 	// The pragmas go in the DSN rather than in db.Exec: most pragmas are
 	// per-connection state, and an Exec runs on a single pooled connection,
@@ -70,9 +72,15 @@ func openSqlite(cfg SqliteCfg, drv SqliteDriver, gcfg *gorm.Config) (*gorm.DB, e
 	//
 	// A file database is addressed by a file: URI with an escaped path, like
 	// the readers', so '?' or '#' in a folder name do not cut the path short.
-	dsn := ":memory:?" + drv.Params(timeout, true).Encode()
-	if !memory {
-		dsn = fileDSN(cfg.Path, drv.Params(timeout, true))
+	params := drv.Params(timeout, true)
+	var dsn string
+	if memory {
+		dsn = ":memory:?" + params.Encode()
+	} else {
+		if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o750); err != nil {
+			return nil, fmt.Errorf("create sqlite directory: %w", err)
+		}
+		dsn = fileDSN(cfg.Path, params)
 	}
 
 	writer, err := sql.Open(drv.SQLDriverName(), dsn)
@@ -125,10 +133,13 @@ func addReaders(db *gorm.DB, writer *sql.DB, cfg SqliteCfg, drv SqliteDriver, ti
 	err = db.Use(dbresolver.Register(dbresolver.Config{
 		Replicas: []gorm.Dialector{drv.Dialector(readers)},
 	}))
+	if err == nil {
+		// registered after dbresolver, so its callbacks can wrap dbresolver's
+		err = db.Use(&sqlitePools{writer: writer, readers: readers})
+	}
 	if err != nil {
 		_ = readers.Close()
 		return fmt.Errorf("sqlite: set up the read pool: %w", err)
 	}
-	readerPools.Store(writer, readers)
 	return nil
 }

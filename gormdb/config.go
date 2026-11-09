@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -45,7 +46,9 @@ type SqliteCfg struct {
 	// next to it.
 	Path string
 	// BusyTimeout is how long a connection waits for a lock held by another
-	// one before failing with SQLITE_BUSY; zero means 5s.
+	// one before failing with SQLITE_BUSY; zero means 5s. SQLite counts in
+	// whole milliseconds: it is rounded down, to at least 1ms. It must not be
+	// negative.
 	BusyTimeout time.Duration
 	// Readers is the size of the read-only connection pool; zero means 10.
 	Readers int
@@ -53,8 +56,12 @@ type SqliteCfg struct {
 
 // PostgresCfg configures a Postgres connection.
 type PostgresCfg struct {
-	Host     string
-	Port     int // zero means 5432
+	// Host is a host name or IP address, without a port (see Port) and, for
+	// IPv6, without brackets.
+	Host string
+	Port int // zero means 5432
+	// User may be empty: libpq's defaults (PGUSER, the OS user) then apply,
+	// and Password, if set, is still sent.
 	User     string
 	Password string
 	DbName   string
@@ -74,16 +81,21 @@ func (c PostgresCfg) DSN() string {
 	if sslMode == "" {
 		sslMode = defaultSslMode
 	}
+	q := url.Values{"sslmode": {sslMode}}
 	u := url.URL{
-		Scheme:   "postgres",
-		Host:     net.JoinHostPort(c.Host, strconv.Itoa(port)),
-		Path:     "/" + c.DbName,
-		RawQuery: url.Values{"sslmode": {sslMode}}.Encode(),
+		Scheme: "postgres",
+		Host:   net.JoinHostPort(c.Host, strconv.Itoa(port)),
+		Path:   "/" + c.DbName,
 	}
-	// without a user, libpq's defaults (PGUSER, the OS user) apply
-	if c.User != "" {
+	switch {
+	case c.User != "":
 		u.User = url.UserPassword(c.User, c.Password)
+	case c.Password != "":
+		// without a user, libpq's defaults (PGUSER, the OS user) apply; the
+		// password goes in the query, as userinfo needs a user name
+		q.Set("password", c.Password)
 	}
+	u.RawQuery = q.Encode()
 	return u.String()
 }
 
@@ -101,9 +113,17 @@ func (c Cfg) Validate() error {
 		if c.Sqlite.Readers < 0 {
 			return errors.New("sqlite: readers must not be negative")
 		}
+		if c.Sqlite.BusyTimeout < 0 {
+			return errors.New("sqlite: busy timeout must not be negative")
+		}
 	case DriverPostgres:
 		if c.Postgres.Host == "" {
 			return errors.New("postgres: host must not be empty")
+		}
+		// a ':' is only valid in an IPv6 address; "db:5433" is a host with a port
+		// (netip, unlike net.ParseIP, accepts a zone: fe80::1%eth0)
+		if _, err := netip.ParseAddr(c.Postgres.Host); strings.Contains(c.Postgres.Host, ":") && err != nil {
+			return fmt.Errorf("postgres: host %q must not include a port (set Port) or IPv6 brackets", c.Postgres.Host)
 		}
 		if c.Postgres.DbName == "" {
 			return errors.New("postgres: database name must not be empty")
