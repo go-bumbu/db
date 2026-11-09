@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -148,24 +149,35 @@ func checkPinning(db *gorm.DB, pool *sql.DB) error {
 	return nil
 }
 
-// depVersions returns the GORM and dbresolver versions linked in the binary.
+// pinningDeps are the modules whose behaviour checkPinning relies on.
+var pinningDeps = []string{"gorm.io/gorm", "gorm.io/plugin/dbresolver"}
+
+// depVersions names the GORM and dbresolver modules with the versions linked
+// in the binary. Build info is best effort: test binaries built before Go
+// 1.27 carry no dependencies, and some builds strip it. A module whose
+// version is not found is still named, as "(version unknown)", so the error
+// always says what to check.
 func depVersions() string {
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return "unknown"
-	}
-	var vs []string
-	for _, m := range info.Deps {
-		if m.Path != "gorm.io/gorm" && m.Path != "gorm.io/plugin/dbresolver" {
-			continue
+	found := map[string]string{}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, m := range info.Deps {
+			if !slices.Contains(pinningDeps, m.Path) {
+				continue
+			}
+			v := m.Version
+			if m.Replace != nil {
+				v = strings.TrimSpace("=> " + m.Replace.Path + " " + m.Replace.Version)
+			}
+			found[m.Path] = v
 		}
-		if m.Replace != nil {
-			m = m.Replace
-		}
-		vs = append(vs, m.Path+" "+m.Version)
 	}
-	if len(vs) == 0 {
-		return "unknown"
+	vs := make([]string, 0, len(pinningDeps))
+	for _, p := range pinningDeps {
+		v := found[p]
+		if v == "" {
+			v = "(version unknown)"
+		}
+		vs = append(vs, p+" "+v)
 	}
 	return strings.Join(vs, ", ")
 }

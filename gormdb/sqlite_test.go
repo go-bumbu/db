@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"testing"
@@ -142,7 +143,17 @@ func TestCheckPinningDetectsMissingWrapper(t *testing.T) {
 	if err == nil {
 		t.Fatal("the check passed without the wrapper")
 	}
-	for _, want := range []string{"create, query, update, delete, row, raw", "gorm.io/gorm", "not supported"} {
+	// The modules are named on every build; their versions only where the
+	// binary carries build info for them (test binaries do from Go 1.27).
+	wants := []string{"create, query, update, delete, row, raw", "not supported", "gorm.io/gorm ", "gorm.io/plugin/dbresolver "}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, m := range info.Deps {
+			if (m.Path == "gorm.io/gorm" || m.Path == "gorm.io/plugin/dbresolver") && m.Replace == nil {
+				wants = append(wants, m.Path+" "+m.Version)
+			}
+		}
+	}
+	for _, want := range wants {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
 		}
